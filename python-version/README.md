@@ -13,7 +13,10 @@ A Python-based CV/Resume data extraction tool that uses Google Gemini AI to extr
 
 ## Installation
 
-1. **Clone or download the repository**
+1. **Navigate to the Python version directory**:
+```bash
+cd python-version
+```
 
 2. **Install Python dependencies**:
 ```bash
