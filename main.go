@@ -1,11 +1,15 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"encoding/xml"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -199,7 +203,20 @@ func worker(jobs <-chan FileJob, results chan<- ProcessedCV, inputDir string, cl
 		if ext == ".pdf" {
 			text, err = extractTextFromPDF(job.FilePath)
 		} else if ext == ".docx" {
+			// Try the unioffice extractor first (may require a license). If it fails, fall back to a zip/xml-based reader.
 			text, err = extractTextFromDOCX(job.FilePath)
+			if err != nil {
+				// Attempt fallback extractor
+				log.Printf("unioffice extractor failed for %s: %v. Trying fallback extractor...", job.FileName, err)
+				fbText, fbErr := extractTextFromDOCXFallback(job.FilePath)
+				if fbErr == nil {
+					text = fbText
+					err = nil
+				} else {
+					// keep original error if fallback also fails
+					log.Printf("fallback extractor also failed for %s: %v", job.FileName, fbErr)
+				}
+			}
 		}
 		if err != nil {
 			results <- ProcessedCV{
@@ -269,7 +286,7 @@ CV Text:
 
 	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
-		return CVData{}, fmt.Errorf("Gemini API error: %v", err)
+		return CVData{}, fmt.Errorf("gemini API error: %v", err)
 	}
 
 	if len(resp.Candidates) == 0 {
@@ -289,23 +306,17 @@ CV Text:
 		content = fmt.Sprintf("%v", part)
 	}
 
-	// Clean the content - remove markdown code blocks if present
+	// Clean the content - remove markdown code fences if present
 	content = strings.TrimSpace(content)
-	if strings.HasPrefix(content, "```json") {
-		content = strings.TrimPrefix(content, "```json")
-	}
-	if strings.HasPrefix(content, "```") {
-		content = strings.TrimPrefix(content, "```")
-	}
-	if strings.HasSuffix(content, "```") {
-		content = strings.TrimSuffix(content, "```")
-	}
+	content = strings.TrimPrefix(content, "```json")
+	content = strings.TrimPrefix(content, "```")
+	content = strings.TrimSuffix(content, "```")
 	content = strings.TrimSpace(content)
 
 	var aiResp GeminiResponse
 	err = json.Unmarshal([]byte(content), &aiResp)
 	if err != nil {
-		return CVData{}, fmt.Errorf("failed to parse Gemini response: %v (content: %s)", err, content)
+		return CVData{}, fmt.Errorf("failed to parse gemini response: %v (content: %s)", err, content)
 	}
 
 	return CVData{
@@ -370,6 +381,63 @@ func extractTextFromDOCX(filePath string) (string, error) {
 	}
 
 	return text.String(), nil
+}
+
+// extractTextFromDOCXFallback reads the .docx file as a zip archive, finds word/document.xml
+// and extracts text from <w:t> elements. This avoids the need for a unioffice license.
+func extractTextFromDOCXFallback(filePath string) (string, error) {
+	zr, err := zip.OpenReader(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer zr.Close()
+
+	var docFile *zip.File
+	for _, f := range zr.File {
+		if f.Name == "word/document.xml" {
+			docFile = f
+			break
+		}
+	}
+	if docFile == nil {
+		return "", fmt.Errorf("word/document.xml not found in docx")
+	}
+
+	rc, err := docFile.Open()
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return "", err
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	var sb strings.Builder
+	for {
+		tok, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		switch se := tok.(type) {
+		case xml.StartElement:
+			// capture text nodes; local name may be "t" (w:t)
+			if se.Name.Local == "t" {
+				var content string
+				if err := decoder.DecodeElement(&content, &se); err == nil {
+					sb.WriteString(content)
+					sb.WriteString(" ")
+				}
+			}
+		}
+	}
+
+	return strings.TrimSpace(sb.String()), nil
 }
 
 func saveToCSV(data []CVData, filename string) error {
