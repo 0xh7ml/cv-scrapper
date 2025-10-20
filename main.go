@@ -1,666 +1,355 @@
 package main
 
 import (
-	"archive/zip"
-	"bytes"
-	"context"
 	"encoding/csv"
 	"encoding/json"
-	"encoding/xml"
-	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/generative-ai-go/genai"
-	"github.com/ledongthuc/pdf"
-	"google.golang.org/api/option"
+	"github.com/joho/godotenv"
 )
 
-type CVData struct {
+// Config holds application configuration
+type Config struct {
+	BaseURL     string
+	AuthToken   string
+	StartID     int
+	EndID       int
+	Concurrency int
+	OutputFile  string
+	Timeout     time.Duration
+	S3Bucket    string
+}
+
+// APIResponse represents the API response structure
+type APIResponse struct {
+	Success  bool `json:"success"`
+	Response struct {
+		Data *CandidateData `json:"data"`
+	} `json:"response"`
+}
+
+// CandidateData represents the candidate information
+type CandidateData struct {
+	ID         int    `json:"id"`
+	FirstName  string `json:"first_name"`
+	MiddleName string `json:"middle_name"`
+	LastName   string `json:"last_name"`
+	User       struct {
+		Email         string `json:"email"`
+		ContactNumber string `json:"contact_number"`
+		DialCode      string `json:"dial_code"`
+	} `json:"user"`
+	Skills []struct {
+		SkillName string `json:"skill_name"`
+	} `json:"skills"`
+	CandidateExperience []struct {
+		OrganizationName string `json:"organization_name"`
+		OrganizationDesc string `json:"organization_desc"`
+		StartDate        string `json:"start_date"`
+		EndDate          string `json:"end_date"`
+		CurrentlyWorking int    `json:"currently_working"`
+	} `json:"candidate_experience"`
+	CandidateResume []struct {
+		ResumeFullURL string `json:"resume_full_url"`
+	} `json:"candidate_resume"`
+}
+
+// ProcessedCandidate represents the final CSV row data
+type ProcessedCandidate struct {
 	ID         string
 	Name       string
 	Phone      string
 	Email      string
-	Education  string
-	Skills     string
 	Experience string
-}
-
-type FileJob struct {
-	FileName string
-	FilePath string
-	ID       int
-}
-
-type ProcessedCV struct {
-	CV       CVData
-	FileName string
-	Success  bool
-	Error    error
-}
-
-type GeminiResponse struct {
-	Name       string `json:"name"`
-	Phone      string `json:"phone"`
-	Email      string `json:"email"`
-	Education  string `json:"education"`
-	Skills     string `json:"skills"`
-	Experience string `json:"experience"`
-}
-
-// Config holds application configuration
-type Config struct {
-	InputDir    string
-	Concurrency int
-	OutputFile  string
-	APIKey      string
-	RetryCount  int
-	RetryDelay  time.Duration
-	Verbose     bool
-}
-
-// categorizeError groups errors into common types for summary reporting
-func categorizeError(errorMsg string) string {
-	errorMsg = strings.ToLower(errorMsg)
-
-	switch {
-	case strings.Contains(errorMsg, "gemini api error"):
-		return "API Error"
-	case strings.Contains(errorMsg, "timeout"):
-		return "Timeout"
-	case strings.Contains(errorMsg, "failed to parse"):
-		return "JSON Parse Error"
-	case strings.Contains(errorMsg, "text extraction failed"):
-		return "Text Extraction Error"
-	case strings.Contains(errorMsg, "failed to open"):
-		return "File Access Error"
-	case strings.Contains(errorMsg, "no text content"):
-		return "Empty/Corrupted File"
-	case strings.Contains(errorMsg, "failed after") && strings.Contains(errorMsg, "retries"):
-		return "Retry Exhausted"
-	default:
-		return "Other Error"
-	}
+	Skills     string
+	ResumeURLs string
 }
 
 func main() {
-	// Command line flags
-	config := Config{}
-	flag.StringVar(&config.InputDir, "i", "input", "Input directory containing CV files")
-	flag.IntVar(&config.Concurrency, "c", 10, "Number of concurrent goroutines (recommended: 10-20 for API)")
-	flag.StringVar(&config.OutputFile, "o", "extracted_cvs.csv", "Output CSV file")
-	flag.StringVar(&config.APIKey, "key", "", "Gemini API key (or set GEMINI_API_KEY env var)")
-	flag.IntVar(&config.RetryCount, "retry", 3, "Number of retries for failed API calls")
-	flag.BoolVar(&config.Verbose, "v", false, "Enable verbose output (shows detailed errors and debug info)")
-	flag.Parse()
-
-	config.RetryDelay = 2 * time.Second
-
-	// Get Gemini API key
-	if config.APIKey == "" {
-		config.APIKey = os.Getenv("GEMINI_API_KEY")
-	}
-	if config.APIKey == "" {
-		log.Fatal("Gemini API key is required. Use -key flag or set GEMINI_API_KEY environment variable")
-	}
-
-	// Create input directory if it doesn't exist
-	if err := ensureInputDirectory(config.InputDir); err != nil {
-		log.Fatal(err)
-	}
-
-	// Get valid CV files
-	validFiles, err := getValidCVFiles(config.InputDir)
+	// Load configuration
+	config, err := loadConfig()
 	if err != nil {
-		log.Fatal("Error reading input directory:", err)
+		log.Fatal("Failed to load configuration:", err)
 	}
 
-	if len(validFiles) == 0 {
-		fmt.Println("No valid CV files found in the input directory.")
-		return
-	}
+	fmt.Printf("Starting CV scraper...\n")
+	fmt.Printf("Fetching candidates from ID %d to %d\n", config.StartID, config.EndID)
+	fmt.Printf("Using %d concurrent workers\n", config.Concurrency)
 
-	fmt.Printf("Found %d CV files to process\n", len(validFiles))
-
-	// Create Gemini client
-	ctx := context.Background()
-	client, err := genai.NewClient(ctx, option.WithAPIKey(config.APIKey))
+	// Create CSV file
+	csvFile, err := os.Create(config.OutputFile)
 	if err != nil {
-		log.Fatal("Failed to create Gemini client:", err)
+		log.Fatal("Failed to create CSV file:", err)
 	}
-	defer client.Close()
+	defer csvFile.Close()
 
-	// Process files concurrently
-	cvData := processCVsConcurrently(validFiles, config, client)
+	csvWriter := csv.NewWriter(csvFile)
+	defer csvWriter.Flush()
 
-	// Save to CSV
-	if len(cvData) > 0 {
-		if err := saveToCSV(cvData, config.OutputFile); err != nil {
-			log.Fatal("Error saving to CSV:", err)
-		}
-		fmt.Printf("\n✓ Successfully processed %d CVs and saved to %s\n", len(cvData), config.OutputFile)
-	} else {
-		fmt.Println("\n✗ No CVs were processed successfully.")
+	// Write CSV header
+	header := []string{"ID", "Name", "Phone", "Email", "Experience", "Skills", "Resume Files"}
+	if err := csvWriter.Write(header); err != nil {
+		log.Fatal("Failed to write CSV header:", err)
 	}
+
+	// Start processing
+	candidates := processCandidatesConcurrently(config, csvWriter)
+
+	fmt.Printf("\n✓ Successfully processed %d candidates and saved to %s\n", candidates, config.OutputFile)
 }
 
-func ensureInputDirectory(dir string) error {
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if err := os.Mkdir(dir, 0755); err != nil {
-			return fmt.Errorf("failed to create directory: %v", err)
-		}
-		fmt.Printf("Created '%s' directory. Please place your CV files there.\n", dir)
-		os.Exit(0)
+func loadConfig() (*Config, error) {
+	// Load .env file
+	if err := godotenv.Load(); err != nil {
+		log.Println("Warning: .env file not found, using environment variables")
 	}
-	return nil
+
+	config := &Config{
+		BaseURL:     getEnv("API_BASE_URL", ""),
+		AuthToken:   getEnv("AUTH_TOKEN", ""),
+		StartID:     getEnvInt("START_ID", 1),
+		EndID:       getEnvInt("END_ID", 317376),
+		Concurrency: getEnvInt("CONCURRENCY", 10),
+		OutputFile:  getEnv("OUTPUT_FILE", "candidates.csv"),
+		Timeout:     time.Duration(getEnvInt("TIMEOUT_SECONDS", 30)) * time.Second,
+		S3Bucket:    getEnv("S3_BUCKET_URL", "https://atbjobs.s3.ap-southeast-1.amazonaws.com/candidate/resume/"),
+	}
+
+	if config.AuthToken == "" {
+		return nil, fmt.Errorf("AUTH_TOKEN is required in .env file")
+	}
+
+	return config, nil
 }
 
-func getValidCVFiles(inputDir string) ([]string, error) {
-	files, err := os.ReadDir(inputDir)
-	if err != nil {
-		return nil, err
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
-
-	var validFiles []string
-	supportedExts := map[string]bool{".pdf": true, ".docx": true, ".doc": true}
-
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-
-		fileName := file.Name()
-		ext := strings.ToLower(filepath.Ext(fileName))
-
-		if supportedExts[ext] {
-			validFiles = append(validFiles, fileName)
-		} else {
-			fmt.Printf("⊘ Skipping unsupported file: %s\n", fileName)
-		}
-	}
-
-	return validFiles, nil
+	return defaultValue
 }
 
-func processCVsConcurrently(validFiles []string, config Config, client *genai.Client) []CVData {
-	jobs := make(chan FileJob, len(validFiles))
-	results := make(chan ProcessedCV, len(validFiles))
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
 
-	// Create worker pool
+func processCandidatesConcurrently(config *Config, csvWriter *csv.Writer) int {
+	jobs := make(chan int, config.EndID-config.StartID+1)
+	results := make(chan *ProcessedCandidate, 100)
+
 	var wg sync.WaitGroup
+	var mu sync.Mutex // Mutex for CSV writing
+	processedCount := 0
+
+	// Start workers
 	for i := 0; i < config.Concurrency; i++ {
 		wg.Add(1)
-		go worker(jobs, results, config, client, &wg)
+		go worker(jobs, results, config, &wg)
 	}
 
 	// Send jobs
 	go func() {
-		for i, fileName := range validFiles {
-			filePath := filepath.Join(config.InputDir, fileName)
-			jobs <- FileJob{
-				FileName: fileName,
-				FilePath: filePath,
-				ID:       i + 1,
-			}
+		for id := config.StartID; id <= config.EndID; id++ {
+			jobs <- id
 		}
 		close(jobs)
 	}()
 
-	// Close results channel when all workers are done
+	// Close results when all workers are done
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collect results with timeout protection
-	var cvData []CVData
-	successCount := 0
-	failureCount := 0
-	errorSummary := make(map[string]int) // Track error types
-
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("Processing CVs...")
+	// Process results
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println("Processing candidates...")
 	fmt.Println(strings.Repeat("=", 60))
 
-	timeout := time.After(30 * time.Minute) // Generous timeout
-
-	for {
-		select {
-		case result, ok := <-results:
-			if !ok {
-				// Channel closed, we're done
-				goto finish
+	for candidate := range results {
+		if candidate != nil {
+			mu.Lock()
+			record := []string{
+				candidate.ID,
+				candidate.Name,
+				candidate.Phone,
+				candidate.Email,
+				candidate.Experience,
+				candidate.Skills,
+				candidate.ResumeURLs,
 			}
-			if result.Success {
-				successCount++
-				fmt.Printf("[%d] %s - Successfully processed\n", successCount+failureCount, result.FileName)
-
-				// Rename file
-				if err := renameProcessedFile(config.InputDir, result.FileName, result.CV.ID); err != nil {
-					fmt.Printf("Warning: Could not rename file: %v\n", err)
-				}
-
-				cvData = append(cvData, result.CV)
+			if err := csvWriter.Write(record); err != nil {
+				log.Printf("Error writing CSV record for ID %s: %v", candidate.ID, err)
 			} else {
-				failureCount++
-				if result.Error != nil {
-					// Categorize error for summary
-					errorType := categorizeError(result.Error.Error())
-					errorSummary[errorType]++
-
-					// Show brief error info even in non-verbose mode
-					errorMsg := result.Error.Error()
-					if !config.Verbose && len(errorMsg) > 100 {
-						// Truncate long error messages for readability
-						errorMsg = errorMsg[:100] + "..."
-					}
-					fmt.Printf("✗ [%d] %s - %s\n", successCount+failureCount, result.FileName, errorMsg)
-				} else {
-					fmt.Printf("⊘ [%d] %s - No useful data found\n", successCount+failureCount, result.FileName)
+				processedCount++
+				if processedCount%100 == 0 {
+					fmt.Printf("Processed %d candidates...\n", processedCount)
 				}
 			}
-		case <-timeout:
-			fmt.Printf("\n⚠ Processing timed out after 30 minutes\n")
-			goto finish
+			mu.Unlock()
 		}
 	}
 
-finish:
 	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("Processing complete: %d succeeded, %d failed\n", successCount, failureCount)
-
-	// Show error summary if there were failures
-	if failureCount > 0 && len(errorSummary) > 0 {
-		fmt.Println("\nError Summary:")
-		for errorType, count := range errorSummary {
-			fmt.Printf("  %s: %d files\n", errorType, count)
-		}
-	}
-	fmt.Println(strings.Repeat("=", 60))
-
-	return cvData
+	return processedCount
 }
 
-func worker(jobs <-chan FileJob, results chan<- ProcessedCV, config Config, client *genai.Client, wg *sync.WaitGroup) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Worker panic recovered: %v", r)
-		}
-		wg.Done()
-	}()
+func worker(jobs <-chan int, results chan<- *ProcessedCandidate, config *Config, wg *sync.WaitGroup) {
+	defer wg.Done()
 
-	for job := range jobs {
-		// Extract text from file
-		text, err := extractTextFromFile(job.FilePath, config.Verbose)
+	client := &http.Client{
+		Timeout: config.Timeout,
+	}
+
+	for id := range jobs {
+		candidate, err := fetchCandidate(client, id, config)
 		if err != nil {
-			results <- ProcessedCV{
-				FileName: job.FileName,
-				Success:  false,
-				Error:    fmt.Errorf("text extraction failed: %v", err),
+			// Only log errors in verbose mode to avoid spam
+			if os.Getenv("VERBOSE") == "true" {
+				log.Printf("Error fetching candidate ID %d: %v", id, err)
 			}
 			continue
 		}
 
-		// Validate extracted text
-		if strings.TrimSpace(text) == "" {
-			results <- ProcessedCV{
-				FileName: job.FileName,
-				Success:  false,
-				Error:    fmt.Errorf("extracted text is empty"),
-			}
-			continue
-		}
-
-		// Extract CV data using Gemini with retry logic
-		cv, err := extractCVDataWithRetry(text, fmt.Sprintf("%03d", job.ID), client, config.RetryCount, config.RetryDelay, config.Verbose)
-		if err != nil {
-			results <- ProcessedCV{
-				FileName: job.FileName,
-				Success:  false,
-				Error:    err,
-			}
-			continue
-		}
-
-		// Skip if no useful data found
-		if isEmptyCV(cv) {
-			results <- ProcessedCV{
-				FileName: job.FileName,
-				Success:  false,
-				Error:    nil,
-			}
-			continue
-		}
-
-		results <- ProcessedCV{
-			CV:       cv,
-			FileName: job.FileName,
-			Success:  true,
-			Error:    nil,
+		if candidate != nil {
+			results <- candidate
 		}
 	}
 }
 
-func extractTextFromFile(filePath string, verbose bool) (string, error) {
-	ext := strings.ToLower(filepath.Ext(filePath))
+func fetchCandidate(client *http.Client, id int, config *Config) (*ProcessedCandidate, error) {
+	url := fmt.Sprintf("%s/%d", config.BaseURL, id)
 
-	switch ext {
-	case ".pdf":
-		return extractTextFromPDF(filePath, verbose)
-	case ".docx", ".doc":
-		return extractTextFromDOCX(filePath)
-	default:
-		return "", fmt.Errorf("unsupported file format: %s", ext)
-	}
-}
-
-func extractCVDataWithRetry(text, id string, client *genai.Client, retryCount int, retryDelay time.Duration, verbose bool) (CVData, error) {
-	var lastErr error
-
-	for attempt := 0; attempt <= retryCount; attempt++ {
-		if attempt > 0 {
-			time.Sleep(retryDelay * time.Duration(attempt))
-		}
-
-		cv, err := extractCVDataWithGemini(text, id, client, verbose)
-		if err == nil {
-			return cv, nil
-		}
-
-		lastErr = err
-		if attempt < retryCount {
-			// Only log retry details in verbose mode to avoid cluttering output
-			if verbose {
-				log.Printf("Retry %d/%d for CV %s: %v", attempt+1, retryCount, id, err)
-			}
-		}
-	}
-
-	return CVData{}, fmt.Errorf("failed after %d retries: %v", retryCount, lastErr)
-}
-
-func extractCVDataWithGemini(text, id string, client *genai.Client, verbose bool) (CVData, error) {
-	// Truncate text if too long (Gemini has token limits)
-	if len(text) > 10000 {
-		text = text[:10000] + "... [truncated]"
-	}
-
-	prompt := `You are an expert CV/Resume data extraction system. Extract the following information from the CV text and return it as a JSON object.
-
-Required fields:
-- name: Full name of the person
-- phone: Phone number (normalize format, include country code if present)
-- email: Email address
-- education: Educational background, degrees, institutions (summarize key points)
-- skills: Technical skills, competencies, programming languages (comma-separated list)
-- experience: Work experience, job titles, companies, duration (summarize key roles)
-
-Rules:
-1. If a field is not found, return empty string ""
-2. For education: Include degree, institution, year if available
-3. For skills: Extract technical skills, software, programming languages
-4. For experience: Include job titles, companies, and brief descriptions
-5. Keep each field concise but informative (max 200 chars per field)
-6. Return ONLY valid JSON, no additional text or markdown formatting
-
-CV Text:
-` + text
-
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-
-	model := client.GenerativeModel("gemini-2.0-flash")
-	model.SetTemperature(0.1)
-	model.SetMaxOutputTokens(800)
-
-	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return CVData{}, fmt.Errorf("gemini API error: %v", err)
+		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return CVData{}, fmt.Errorf("empty response from Gemini")
+	req.Header.Set("Authorization", "Bearer "+config.AuthToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	// Extract and clean content
-	content := extractContentFromResponse(resp.Candidates[0].Content.Parts[0])
-	content = cleanJSONResponse(content)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %v", err)
+	}
 
-	var aiResp GeminiResponse
-	if err := json.Unmarshal([]byte(content), &aiResp); err != nil {
-		if verbose {
-			return CVData{}, fmt.Errorf("failed to parse JSON: %v (content: %s)", err, content)
+	var apiResp APIResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %v", err)
+	}
+
+	// Check if the response indicates success and has data
+	if !apiResp.Success || apiResp.Response.Data == nil {
+		return nil, nil // Skip this record
+	}
+
+	return processCandidate(apiResp.Response.Data, config), nil
+}
+
+func processCandidate(data *CandidateData, config *Config) *ProcessedCandidate {
+	// Build full name
+	var nameParts []string
+	if data.FirstName != "" {
+		nameParts = append(nameParts, data.FirstName)
+	}
+	if data.MiddleName != "" {
+		nameParts = append(nameParts, data.MiddleName)
+	}
+	if data.LastName != "" {
+		nameParts = append(nameParts, data.LastName)
+	}
+	fullName := strings.Join(nameParts, " ")
+
+	// Build phone number
+	phone := ""
+	if data.User.ContactNumber != "" {
+		if data.User.DialCode != "" {
+			phone = data.User.DialCode + data.User.ContactNumber
 		} else {
-			return CVData{}, fmt.Errorf("failed to parse API response as JSON")
+			phone = data.User.ContactNumber
 		}
 	}
 
-	return CVData{
-		ID:         id,
-		Name:       strings.TrimSpace(aiResp.Name),
-		Phone:      strings.TrimSpace(aiResp.Phone),
-		Email:      strings.TrimSpace(aiResp.Email),
-		Education:  strings.TrimSpace(aiResp.Education),
-		Skills:     strings.TrimSpace(aiResp.Skills),
-		Experience: strings.TrimSpace(aiResp.Experience),
-	}, nil
-}
-
-func extractContentFromResponse(part interface{}) string {
-	if textPart, ok := part.(genai.Text); ok {
-		return string(textPart)
-	}
-	return fmt.Sprintf("%v", part)
-}
-
-func cleanJSONResponse(content string) string {
-	content = strings.TrimSpace(content)
-
-	// Remove markdown code fences
-	content = strings.TrimPrefix(content, "```json")
-	content = strings.TrimPrefix(content, "```JSON")
-	content = strings.TrimPrefix(content, "```")
-	content = strings.TrimSuffix(content, "```")
-	content = strings.TrimSpace(content)
-
-	// Find JSON object bounds
-	start := strings.Index(content, "{")
-	end := strings.LastIndex(content, "}")
-
-	if start != -1 && end != -1 && end > start {
-		content = content[start : end+1]
-	}
-
-	return content
-}
-
-func isEmptyCV(cv CVData) bool {
-	return cv.Name == "" && cv.Phone == "" && cv.Email == ""
-}
-
-func renameProcessedFile(inputDir, oldFileName, id string) error {
-	ext := strings.ToLower(filepath.Ext(oldFileName))
-	newFileName := fmt.Sprintf("%s%s", id, ext)
-	oldPath := filepath.Join(inputDir, oldFileName)
-	newPath := filepath.Join(inputDir, newFileName)
-
-	// Don't rename if already has the target name
-	if oldFileName == newFileName {
-		return nil
-	}
-
-	// Check if target file already exists
-	if _, err := os.Stat(newPath); err == nil {
-		return fmt.Errorf("file %s already exists", newFileName)
-	}
-
-	return os.Rename(oldPath, newPath)
-}
-
-func extractTextFromPDF(filePath string, verbose bool) (string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to open PDF: %v", err)
-	}
-	defer file.Close()
-
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return "", fmt.Errorf("failed to stat PDF: %v", err)
-	}
-
-	pdfReader, err := pdf.NewReader(file, fileInfo.Size())
-	if err != nil {
-		return "", fmt.Errorf("failed to create PDF reader: %v", err)
-	}
-
-	var text strings.Builder
-	pageCount := pdfReader.NumPage()
-
-	for i := 1; i <= pageCount; i++ {
-		page := pdfReader.Page(i)
-		if page.V.IsNull() {
-			continue
+	// Extract skills
+	var skills []string
+	for _, skill := range data.Skills {
+		if skill.SkillName != "" {
+			skills = append(skills, skill.SkillName)
 		}
+	}
+	skillsStr := strings.Join(skills, ", ")
 
-		pageText, err := page.GetPlainText(nil)
-		if err != nil {
-			if verbose {
-				log.Printf("Warning: Could not extract text from page %d: %v", i, err)
+	// Extract experience
+	var experiences []string
+	for _, exp := range data.CandidateExperience {
+		if exp.OrganizationName != "" {
+			expStr := exp.OrganizationName
+			if exp.OrganizationDesc != "" {
+				// Limit description length
+				desc := exp.OrganizationDesc
+				if len(desc) > 200 {
+					desc = desc[:200] + "..."
+				}
+				expStr += " - " + desc
 			}
-			continue
-		}
-
-		text.WriteString(pageText)
-		text.WriteString("\n")
-	}
-
-	result := text.String()
-	if strings.TrimSpace(result) == "" {
-		return "", fmt.Errorf("no text content extracted from PDF")
-	}
-
-	return result, nil
-}
-
-// extractTextFromDOCX reads .docx/.doc files as zip archives and extracts text from word/document.xml
-// This works for both .docx and many .doc files saved in the Office Open XML format
-func extractTextFromDOCX(filePath string) (string, error) {
-	zr, err := zip.OpenReader(filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to open as zip archive: %v", err)
-	}
-	defer zr.Close()
-
-	// Find document.xml
-	var docFile *zip.File
-	for _, f := range zr.File {
-		if f.Name == "word/document.xml" {
-			docFile = f
-			break
+			experiences = append(experiences, expStr)
 		}
 	}
+	experienceStr := strings.Join(experiences, " | ")
 
-	if docFile == nil {
-		return "", fmt.Errorf("word/document.xml not found in archive")
-	}
+	// Extract resume URLs - extract filename only
+	var resumeFilenames []string
+	for _, resume := range data.CandidateResume {
+		if resume.ResumeFullURL != "" {
+			// Extract filename from URL by removing the base path
+			filename := strings.TrimPrefix(resume.ResumeFullURL, config.S3Bucket)
 
-	rc, err := docFile.Open()
-	if err != nil {
-		return "", fmt.Errorf("failed to open document.xml: %v", err)
-	}
-	defer rc.Close()
-
-	data, err := io.ReadAll(rc)
-	if err != nil {
-		return "", fmt.Errorf("failed to read document.xml: %v", err)
-	}
-
-	return parseWordXML(data)
-}
-
-// parseWordXML extracts text from Word XML content
-func parseWordXML(data []byte) (string, error) {
-	decoder := xml.NewDecoder(bytes.NewReader(data))
-	var sb strings.Builder
-	var inParagraph bool
-
-	for {
-		tok, err := decoder.Token()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("XML parsing error: %v", err)
-		}
-
-		switch se := tok.(type) {
-		case xml.StartElement:
-			// Track paragraphs for better text formatting
-			if se.Name.Local == "p" {
-				inParagraph = true
-			}
-			// Extract text nodes (w:t elements)
-			if se.Name.Local == "t" {
-				var content string
-				if err := decoder.DecodeElement(&content, &se); err == nil {
-					sb.WriteString(content)
+			// If the URL doesn't match the expected pattern, extract filename from the last part
+			if filename == resume.ResumeFullURL {
+				// Fallback: get the last part after the last "/"
+				parts := strings.Split(resume.ResumeFullURL, "/")
+				if len(parts) > 0 {
+					filename = parts[len(parts)-1]
 				}
 			}
-		case xml.EndElement:
-			// Add newline after paragraphs
-			if se.Name.Local == "p" && inParagraph {
-				sb.WriteString("\n")
-				inParagraph = false
+
+			if filename != "" {
+				resumeFilenames = append(resumeFilenames, filename)
 			}
 		}
 	}
+	resumeFilenamesStr := strings.Join(resumeFilenames, ", ")
 
-	result := strings.TrimSpace(sb.String())
-	if result == "" {
-		return "", fmt.Errorf("no text content extracted from document")
+	return &ProcessedCandidate{
+		ID:         strconv.Itoa(data.ID),
+		Name:       fullName,
+		Phone:      phone,
+		Email:      data.User.Email,
+		Experience: experienceStr,
+		Skills:     skillsStr,
+		ResumeURLs: resumeFilenamesStr,
 	}
-
-	return result, nil
-}
-
-func saveToCSV(data []CVData, filename string) error {
-	file, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("failed to create CSV file: %v", err)
-	}
-	defer file.Close()
-
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	// Write header
-	header := []string{"CV-ID", "Name", "Phone", "Email", "Education", "Skills", "Experience"}
-	if err := writer.Write(header); err != nil {
-		return fmt.Errorf("failed to write CSV header: %v", err)
-	}
-
-	// Write data
-	for _, cv := range data {
-		record := []string{
-			cv.ID,
-			cv.Name,
-			cv.Phone,
-			cv.Email,
-			cv.Education,
-			cv.Skills,
-			cv.Experience,
-		}
-		if err := writer.Write(record); err != nil {
-			return fmt.Errorf("failed to write CSV record: %v", err)
-		}
-	}
-
-	return nil
 }
