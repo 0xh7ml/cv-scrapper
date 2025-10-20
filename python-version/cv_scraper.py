@@ -17,10 +17,31 @@ from typing import List, Optional, Dict, Any
 import zipfile
 import xml.etree.ElementTree as ET
 
-import google.generativeai as genai
-from docx import Document
-import PyPDF2
-import fitz  # PyMuPDF - better PDF text extraction
+# Import with graceful error handling for optional dependencies
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
+try:
+    from docx import Document
+except ImportError:
+    Document = None
+
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
 
 
 # Configure logging
@@ -65,48 +86,87 @@ class TextExtractor:
     
     @staticmethod
     def extract_from_pdf(file_path: Path) -> str:
-        """Extract text from PDF using PyMuPDF (fallback to PyPDF2)"""
-        try:
-            # Try PyMuPDF first (better text extraction)
-            doc = fitz.open(file_path)
+        """Extract text from PDF using multiple extraction methods"""
+        extractors = [
+            ("PyMuPDF", TextExtractor._extract_with_pymupdf),
+            ("pdfplumber", TextExtractor._extract_with_pdfplumber),
+            ("PyPDF2", TextExtractor._extract_with_pypdf2),
+        ]
+        
+        for extractor_name, extractor_func in extractors:
+            try:
+                text = extractor_func(file_path)
+                if text.strip():  # Only return if we got meaningful text
+                    logger.debug(f"Successfully extracted text using {extractor_name}")
+                    return text
+            except Exception as e:
+                logger.debug(f"{extractor_name} failed for {file_path}: {e}")
+                continue
+        
+        raise Exception("All PDF extractors failed to extract meaningful text")
+    
+    @staticmethod
+    def _extract_with_pymupdf(file_path: Path) -> str:
+        """Extract text using PyMuPDF (fitz)"""
+        if fitz is None:
+            raise ImportError("PyMuPDF (fitz) is not installed")
+        
+        doc = fitz.open(file_path)
+        text_parts = []
+        
+        for page in doc:
+            text_parts.append(page.get_text())
+        
+        doc.close()
+        return '\n'.join(text_parts)
+    
+    @staticmethod
+    def _extract_with_pdfplumber(file_path: Path) -> str:
+        """Extract text using pdfplumber (good for complex layouts)"""
+        if pdfplumber is None:
+            raise ImportError("pdfplumber is not installed")
+        
+        text_parts = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    text_parts.append(text)
+        
+        return '\n'.join(text_parts)
+    
+    @staticmethod
+    def _extract_with_pypdf2(file_path: Path) -> str:
+        """Extract text using PyPDF2 (basic extraction)"""
+        if PyPDF2 is None:
+            raise ImportError("PyPDF2 is not installed")
+        
+        with open(file_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
             text_parts = []
             
-            for page in doc:
-                text_parts.append(page.get_text())
+            for page in pdf_reader.pages:
+                text_parts.append(page.extract_text())
             
-            doc.close()
             return '\n'.join(text_parts)
-            
-        except Exception as e:
-            logger.warning(f"PyMuPDF failed for {file_path}, trying PyPDF2: {e}")
-            
-            # Fallback to PyPDF2
-            try:
-                with open(file_path, 'rb') as file:
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    text_parts = []
-                    
-                    for page in pdf_reader.pages:
-                        text_parts.append(page.extract_text())
-                    
-                    return '\n'.join(text_parts)
-                    
-            except Exception as e2:
-                raise Exception(f"Both PDF extractors failed: PyMuPDF({e}), PyPDF2({e2})")
     
     @staticmethod
     def extract_from_docx(file_path: Path) -> str:
         """Extract text from DOCX using python-docx (fallback to zip method)"""
         try:
-            # Try python-docx first
-            doc = Document(file_path)
-            text_parts = []
-            
-            for paragraph in doc.paragraphs:
-                if paragraph.text.strip():
-                    text_parts.append(paragraph.text)
-            
-            return '\n'.join(text_parts)
+            # Try python-docx first if available
+            if Document is not None:
+                doc = Document(file_path)
+                text_parts = []
+                
+                for paragraph in doc.paragraphs:
+                    if paragraph.text.strip():
+                        text_parts.append(paragraph.text)
+                
+                return '\n'.join(text_parts)
+            else:
+                logger.info(f"python-docx not available, using zip method for {file_path}")
+                raise ImportError("python-docx not installed")
             
         except Exception as e:
             logger.warning(f"python-docx failed for {file_path}, trying zip method: {e}")
@@ -144,6 +204,9 @@ class GeminiCVExtractor:
     
     def __init__(self, api_key: str):
         """Initialize Gemini client"""
+        if genai is None:
+            raise ImportError("google-generativeai is not installed. Install it with: pip install google-generativeai")
+        
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
         

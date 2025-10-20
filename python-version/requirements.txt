@@ -1,30 +1,32 @@
 # CV Scraper Requirements
-# PDF processing libraries
+# Core dependencies for all platforms
 PyPDF2==3.0.1
-PyMuPDF==1.23.26
-
-# DOCX processing
 python-docx==1.1.0
-
-# Google Gemini AI
 google-generativeai==0.3.2
 
-# Additional dependencies that might be needed
-# For better argument parsing and configuration
-argparse  # Built-in, but listed for clarity
+# PDF processing with better compatibility
+# Use pre-compiled wheel for PyMuPDF to avoid build issues
+PyMuPDF>=1.23.0
 
-# For concurrent processing
-# concurrent.futures  # Built-in
+# Alternative PDF libraries if PyMuPDF fails
+pdfplumber>=0.9.0
+pypdf>=3.0.0
 
-# Standard library modules used (no installation needed):
-# - asyncio
-# - csv
-# - json
-# - logging
-# - os
-# - shutil
-# - pathlib
-# - typing
-# - zipfile
-# - xml.etree.ElementTree
-# - dataclasses
+# Text processing utilities
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Standard library modules (no installation needed):
+# - argparse (built-in)
+# - asyncio (built-in)
+# - concurrent.futures (built-in)
+# - csv (built-in)
+# - json (built-in)
+# - logging (built-in)
+# - os (built-in)
+# - shutil (built-in)
+# - pathlib (built-in)
+# - typing (built-in)
+# - zipfile (built-in)
+# - xml.etree.ElementTree (built-in)
+# - dataclasses (built-in)
