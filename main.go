@@ -192,7 +192,7 @@ func processCVsConcurrently(validFiles []string, config Config, client *genai.Cl
 		close(results)
 	}()
 
-	// Collect results
+	// Collect results with timeout protection
 	var cvData []CVData
 	successCount := 0
 	failureCount := 0
@@ -201,27 +201,40 @@ func processCVsConcurrently(validFiles []string, config Config, client *genai.Cl
 	fmt.Println("Processing CVs...")
 	fmt.Println(strings.Repeat("=", 60))
 
-	for result := range results {
-		if result.Success {
-			successCount++
-			fmt.Printf("✓ [%d] %s - Successfully processed\n", successCount+failureCount, result.FileName)
+	timeout := time.After(30 * time.Minute) // Generous timeout
 
-			// Rename file
-			if err := renameProcessedFile(config.InputDir, result.FileName, result.CV.ID); err != nil {
-				fmt.Printf("  ⚠ Warning: Could not rename file: %v\n", err)
+	for {
+		select {
+		case result, ok := <-results:
+			if !ok {
+				// Channel closed, we're done
+				goto finish
 			}
+			if result.Success {
+				successCount++
+				fmt.Printf("[%d] %s - Successfully processed\n", successCount+failureCount, result.FileName)
 
-			cvData = append(cvData, result.CV)
-		} else {
-			failureCount++
-			if result.Error != nil {
-				fmt.Printf("✗ [%d] %s - Error: %v\n", successCount+failureCount, result.FileName, result.Error)
+				// Rename file
+				if err := renameProcessedFile(config.InputDir, result.FileName, result.CV.ID); err != nil {
+					fmt.Printf("Warning: Could not rename file: %v\n", err)
+				}
+
+				cvData = append(cvData, result.CV)
 			} else {
-				fmt.Printf("⊘ [%d] %s - No useful data found\n", successCount+failureCount, result.FileName)
+				failureCount++
+				if result.Error != nil {
+					fmt.Printf("[%d] %s - Error: %v\n", successCount+failureCount, result.FileName, result.Error)
+				} else {
+					fmt.Printf("[%d] %s - No useful data found\n", successCount+failureCount, result.FileName)
+				}
 			}
+		case <-timeout:
+			fmt.Printf("\n⚠ Processing timed out after 30 minutes\n")
+			goto finish
 		}
 	}
 
+finish:
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("Processing complete: %d succeeded, %d failed\n", successCount, failureCount)
 	fmt.Println(strings.Repeat("=", 60))
@@ -230,7 +243,12 @@ func processCVsConcurrently(validFiles []string, config Config, client *genai.Cl
 }
 
 func worker(jobs <-chan FileJob, results chan<- ProcessedCV, config Config, client *genai.Client, wg *sync.WaitGroup) {
-	defer wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Worker panic recovered: %v", r)
+		}
+		wg.Done()
+	}()
 
 	for job := range jobs {
 		// Extract text from file
@@ -391,22 +409,22 @@ func extractContentFromResponse(part interface{}) string {
 
 func cleanJSONResponse(content string) string {
 	content = strings.TrimSpace(content)
-	
+
 	// Remove markdown code fences
 	content = strings.TrimPrefix(content, "```json")
 	content = strings.TrimPrefix(content, "```JSON")
 	content = strings.TrimPrefix(content, "```")
 	content = strings.TrimSuffix(content, "```")
 	content = strings.TrimSpace(content)
-	
+
 	// Find JSON object bounds
 	start := strings.Index(content, "{")
 	end := strings.LastIndex(content, "}")
-	
+
 	if start != -1 && end != -1 && end > start {
 		content = content[start : end+1]
 	}
-	
+
 	return content
 }
 
