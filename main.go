@@ -65,6 +65,30 @@ type Config struct {
 	Verbose     bool
 }
 
+// categorizeError groups errors into common types for summary reporting
+func categorizeError(errorMsg string) string {
+	errorMsg = strings.ToLower(errorMsg)
+
+	switch {
+	case strings.Contains(errorMsg, "gemini api error"):
+		return "API Error"
+	case strings.Contains(errorMsg, "timeout"):
+		return "Timeout"
+	case strings.Contains(errorMsg, "failed to parse"):
+		return "JSON Parse Error"
+	case strings.Contains(errorMsg, "text extraction failed"):
+		return "Text Extraction Error"
+	case strings.Contains(errorMsg, "failed to open"):
+		return "File Access Error"
+	case strings.Contains(errorMsg, "no text content"):
+		return "Empty/Corrupted File"
+	case strings.Contains(errorMsg, "failed after") && strings.Contains(errorMsg, "retries"):
+		return "Retry Exhausted"
+	default:
+		return "Other Error"
+	}
+}
+
 func main() {
 	// Command line flags
 	config := Config{}
@@ -198,6 +222,7 @@ func processCVsConcurrently(validFiles []string, config Config, client *genai.Cl
 	var cvData []CVData
 	successCount := 0
 	failureCount := 0
+	errorSummary := make(map[string]int) // Track error types
 
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("Processing CVs...")
@@ -225,11 +250,17 @@ func processCVsConcurrently(validFiles []string, config Config, client *genai.Cl
 			} else {
 				failureCount++
 				if result.Error != nil {
-					if config.Verbose {
-						fmt.Printf("✗ [%d] %s - Error: %v\n", successCount+failureCount, result.FileName, result.Error)
-					} else {
-						fmt.Printf("✗ [%d] %s - Failed to process\n", successCount+failureCount, result.FileName)
+					// Categorize error for summary
+					errorType := categorizeError(result.Error.Error())
+					errorSummary[errorType]++
+
+					// Show brief error info even in non-verbose mode
+					errorMsg := result.Error.Error()
+					if !config.Verbose && len(errorMsg) > 100 {
+						// Truncate long error messages for readability
+						errorMsg = errorMsg[:100] + "..."
 					}
+					fmt.Printf("✗ [%d] %s - %s\n", successCount+failureCount, result.FileName, errorMsg)
 				} else {
 					fmt.Printf("⊘ [%d] %s - No useful data found\n", successCount+failureCount, result.FileName)
 				}
@@ -243,6 +274,14 @@ func processCVsConcurrently(validFiles []string, config Config, client *genai.Cl
 finish:
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("Processing complete: %d succeeded, %d failed\n", successCount, failureCount)
+
+	// Show error summary if there were failures
+	if failureCount > 0 && len(errorSummary) > 0 {
+		fmt.Println("\nError Summary:")
+		for errorType, count := range errorSummary {
+			fmt.Printf("  %s: %d files\n", errorType, count)
+		}
+	}
 	fmt.Println(strings.Repeat("=", 60))
 
 	return cvData
