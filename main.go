@@ -19,7 +19,6 @@ import (
 
 	"github.com/google/generative-ai-go/genai"
 	"github.com/ledongthuc/pdf"
-	"github.com/unidoc/unioffice/document"
 	"google.golang.org/api/option"
 )
 
@@ -32,17 +31,20 @@ type CVData struct {
 	Skills     string
 	Experience string
 }
+
 type FileJob struct {
 	FileName string
 	FilePath string
 	ID       int
 }
+
 type ProcessedCV struct {
 	CV       CVData
 	FileName string
 	Success  bool
 	Error    error
 }
+
 type GeminiResponse struct {
 	Name       string `json:"name"`
 	Phone      string `json:"phone"`
@@ -52,51 +54,45 @@ type GeminiResponse struct {
 	Experience string `json:"experience"`
 }
 
+// Config holds application configuration
+type Config struct {
+	InputDir    string
+	Concurrency int
+	OutputFile  string
+	APIKey      string
+	RetryCount  int
+	RetryDelay  time.Duration
+}
+
 func main() {
 	// Command line flags
-	var inputDir = flag.String("i", "input", "Input directory containing CV files")
-	var concurrency = flag.Int("c", 10, "Number of concurrent goroutines (recommended: 10-20 for API)")
-	var outputFile = flag.String("o", "extracted_cvs.csv", "Output CSV file")
-	var apiKey = flag.String("key", "", "Gemini API key (or set GEMINI_API_KEY env var)")
+	config := Config{}
+	flag.StringVar(&config.InputDir, "i", "input", "Input directory containing CV files")
+	flag.IntVar(&config.Concurrency, "c", 10, "Number of concurrent goroutines (recommended: 10-20 for API)")
+	flag.StringVar(&config.OutputFile, "o", "extracted_cvs.csv", "Output CSV file")
+	flag.StringVar(&config.APIKey, "key", "", "Gemini API key (or set GEMINI_API_KEY env var)")
+	flag.IntVar(&config.RetryCount, "retry", 3, "Number of retries for failed API calls")
 	flag.Parse()
 
+	config.RetryDelay = 2 * time.Second
+
 	// Get Gemini API key
-	geminiKey := *apiKey
-	if geminiKey == "" {
-		geminiKey = os.Getenv("GEMINI_API_KEY")
+	if config.APIKey == "" {
+		config.APIKey = os.Getenv("GEMINI_API_KEY")
 	}
-	if geminiKey == "" {
+	if config.APIKey == "" {
 		log.Fatal("Gemini API key is required. Use -key flag or set GEMINI_API_KEY environment variable")
 	}
 
 	// Create input directory if it doesn't exist
-	if _, err := os.Stat(*inputDir); os.IsNotExist(err) {
-		os.Mkdir(*inputDir, 0755)
-		fmt.Printf("Created '%s' directory. Please place your CV files there.\n", *inputDir)
-		return
+	if err := ensureInputDirectory(config.InputDir); err != nil {
+		log.Fatal(err)
 	}
 
-	// Process files in input directory
-	files, err := os.ReadDir(*inputDir)
+	// Get valid CV files
+	validFiles, err := getValidCVFiles(config.InputDir)
 	if err != nil {
 		log.Fatal("Error reading input directory:", err)
-	}
-
-	// Filter valid CV files
-	var validFiles []string
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-
-		fileName := file.Name()
-		ext := strings.ToLower(filepath.Ext(fileName))
-
-		if ext == ".pdf" || ext == ".docx" {
-			validFiles = append(validFiles, fileName)
-		} else {
-			fmt.Printf("Skipping unsupported file: %s\n", fileName)
-		}
 	}
 
 	if len(validFiles) == 0 {
@@ -108,42 +104,79 @@ func main() {
 
 	// Create Gemini client
 	ctx := context.Background()
-	client, err := genai.NewClient(ctx, option.WithAPIKey(geminiKey))
+	client, err := genai.NewClient(ctx, option.WithAPIKey(config.APIKey))
 	if err != nil {
 		log.Fatal("Failed to create Gemini client:", err)
 	}
 	defer client.Close()
 
 	// Process files concurrently
-	cvData := processCVsConcurrently(validFiles, *inputDir, *concurrency, client)
+	cvData := processCVsConcurrently(validFiles, config, client)
 
 	// Save to CSV
 	if len(cvData) > 0 {
-		err = saveToCSV(cvData, *outputFile)
-		if err != nil {
+		if err := saveToCSV(cvData, config.OutputFile); err != nil {
 			log.Fatal("Error saving to CSV:", err)
 		}
-		fmt.Printf("Successfully processed %d CVs and saved to %s\n", len(cvData), *outputFile)
+		fmt.Printf("\n✓ Successfully processed %d CVs and saved to %s\n", len(cvData), config.OutputFile)
 	} else {
-		fmt.Println("No CVs were processed successfully.")
+		fmt.Println("\n✗ No CVs were processed successfully.")
 	}
 }
 
-func processCVsConcurrently(validFiles []string, inputDir string, concurrency int, client *genai.Client) []CVData {
+func ensureInputDirectory(dir string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.Mkdir(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory: %v", err)
+		}
+		fmt.Printf("Created '%s' directory. Please place your CV files there.\n", dir)
+		os.Exit(0)
+	}
+	return nil
+}
+
+func getValidCVFiles(inputDir string) ([]string, error) {
+	files, err := os.ReadDir(inputDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var validFiles []string
+	supportedExts := map[string]bool{".pdf": true, ".docx": true, ".doc": true}
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		fileName := file.Name()
+		ext := strings.ToLower(filepath.Ext(fileName))
+
+		if supportedExts[ext] {
+			validFiles = append(validFiles, fileName)
+		} else {
+			fmt.Printf("⊘ Skipping unsupported file: %s\n", fileName)
+		}
+	}
+
+	return validFiles, nil
+}
+
+func processCVsConcurrently(validFiles []string, config Config, client *genai.Client) []CVData {
 	jobs := make(chan FileJob, len(validFiles))
 	results := make(chan ProcessedCV, len(validFiles))
 
 	// Create worker pool
 	var wg sync.WaitGroup
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < config.Concurrency; i++ {
 		wg.Add(1)
-		go worker(jobs, results, inputDir, client, &wg)
+		go worker(jobs, results, config, client, &wg)
 	}
 
 	// Send jobs
 	go func() {
 		for i, fileName := range validFiles {
-			filePath := filepath.Join(inputDir, fileName)
+			filePath := filepath.Join(config.InputDir, fileName)
 			jobs <- FileJob{
 				FileName: fileName,
 				FilePath: filePath,
@@ -162,72 +195,67 @@ func processCVsConcurrently(validFiles []string, inputDir string, concurrency in
 	// Collect results
 	var cvData []CVData
 	successCount := 0
+	failureCount := 0
+
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("Processing CVs...")
+	fmt.Println(strings.Repeat("=", 60))
 
 	for result := range results {
 		if result.Success {
 			successCount++
+			fmt.Printf("✓ [%d] %s - Successfully processed\n", successCount+failureCount, result.FileName)
 
 			// Rename file
-			ext := strings.ToLower(filepath.Ext(result.FileName))
-			newFileName := fmt.Sprintf("%s%s", result.CV.ID, ext)
-			oldPath := filepath.Join(inputDir, result.FileName)
-			newPath := filepath.Join(inputDir, newFileName)
-
-			err := os.Rename(oldPath, newPath)
-			if err != nil {
-				fmt.Printf("Warning: Could not rename %s to %s: %v\n", result.FileName, newFileName, err)
-			} else {
-				fmt.Printf("Renamed %s to %s\n", result.FileName, newFileName)
+			if err := renameProcessedFile(config.InputDir, result.FileName, result.CV.ID); err != nil {
+				fmt.Printf("  ⚠ Warning: Could not rename file: %v\n", err)
 			}
 
 			cvData = append(cvData, result.CV)
-		} else if result.Error != nil {
-			fmt.Printf("Error processing %s: %v\n", result.FileName, result.Error)
 		} else {
-			fmt.Printf("No useful data found in %s, skipping...\n", result.FileName)
+			failureCount++
+			if result.Error != nil {
+				fmt.Printf("✗ [%d] %s - Error: %v\n", successCount+failureCount, result.FileName, result.Error)
+			} else {
+				fmt.Printf("⊘ [%d] %s - No useful data found\n", successCount+failureCount, result.FileName)
+			}
 		}
 	}
 
-	fmt.Printf("Processing complete: %d/%d files processed successfully\n", successCount, len(validFiles))
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("Processing complete: %d succeeded, %d failed\n", successCount, failureCount)
+	fmt.Println(strings.Repeat("=", 60))
+
 	return cvData
 }
 
-func worker(jobs <-chan FileJob, results chan<- ProcessedCV, inputDir string, client *genai.Client, wg *sync.WaitGroup) {
+func worker(jobs <-chan FileJob, results chan<- ProcessedCV, config Config, client *genai.Client, wg *sync.WaitGroup) {
 	defer wg.Done()
+
 	for job := range jobs {
-		fmt.Printf("Processing: %s\n", job.FileName)
-		ext := strings.ToLower(filepath.Ext(job.FileName))
 		// Extract text from file
-		var text string
-		var err error
-		if ext == ".pdf" {
-			text, err = extractTextFromPDF(job.FilePath)
-		} else if ext == ".docx" {
-			// Try the unioffice extractor first (may require a license). If it fails, fall back to a zip/xml-based reader.
-			text, err = extractTextFromDOCX(job.FilePath)
-			if err != nil {
-				// Attempt fallback extractor
-				log.Printf("unioffice extractor failed for %s: %v. Trying fallback extractor...", job.FileName, err)
-				fbText, fbErr := extractTextFromDOCXFallback(job.FilePath)
-				if fbErr == nil {
-					text = fbText
-					err = nil
-				} else {
-					// keep original error if fallback also fails
-					log.Printf("fallback extractor also failed for %s: %v", job.FileName, fbErr)
-				}
-			}
-		}
+		text, err := extractTextFromFile(job.FilePath)
 		if err != nil {
 			results <- ProcessedCV{
 				FileName: job.FileName,
 				Success:  false,
-				Error:    err,
+				Error:    fmt.Errorf("text extraction failed: %v", err),
 			}
 			continue
 		}
-		// Extract CV data using Gemini
-		cv, err := extractCVDataWithGemini(text, fmt.Sprintf("%d", job.ID), client)
+
+		// Validate extracted text
+		if strings.TrimSpace(text) == "" {
+			results <- ProcessedCV{
+				FileName: job.FileName,
+				Success:  false,
+				Error:    fmt.Errorf("extracted text is empty"),
+			}
+			continue
+		}
+
+		// Extract CV data using Gemini with retry logic
+		cv, err := extractCVDataWithRetry(text, fmt.Sprintf("%03d", job.ID), client, config.RetryCount, config.RetryDelay)
 		if err != nil {
 			results <- ProcessedCV{
 				FileName: job.FileName,
@@ -238,7 +266,7 @@ func worker(jobs <-chan FileJob, results chan<- ProcessedCV, inputDir string, cl
 		}
 
 		// Skip if no useful data found
-		if cv.Name == "" && cv.Phone == "" && cv.Email == "" {
+		if isEmptyCV(cv) {
 			results <- ProcessedCV{
 				FileName: job.FileName,
 				Success:  false,
@@ -255,7 +283,48 @@ func worker(jobs <-chan FileJob, results chan<- ProcessedCV, inputDir string, cl
 		}
 	}
 }
+
+func extractTextFromFile(filePath string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(filePath))
+
+	switch ext {
+	case ".pdf":
+		return extractTextFromPDF(filePath)
+	case ".docx", ".doc":
+		return extractTextFromDOCX(filePath)
+	default:
+		return "", fmt.Errorf("unsupported file format: %s", ext)
+	}
+}
+
+func extractCVDataWithRetry(text, id string, client *genai.Client, retryCount int, retryDelay time.Duration) (CVData, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= retryCount; attempt++ {
+		if attempt > 0 {
+			time.Sleep(retryDelay * time.Duration(attempt))
+		}
+
+		cv, err := extractCVDataWithGemini(text, id, client)
+		if err == nil {
+			return cv, nil
+		}
+
+		lastErr = err
+		if attempt < retryCount {
+			log.Printf("Retry %d/%d for CV %s: %v", attempt+1, retryCount, id, err)
+		}
+	}
+
+	return CVData{}, fmt.Errorf("failed after %d retries: %v", retryCount, lastErr)
+}
+
 func extractCVDataWithGemini(text, id string, client *genai.Client) (CVData, error) {
+	// Truncate text if too long (Gemini has token limits)
+	if len(text) > 10000 {
+		text = text[:10000] + "... [truncated]"
+	}
+
 	prompt := `You are an expert CV/Resume data extraction system. Extract the following information from the CV text and return it as a JSON object.
 
 Required fields:
@@ -272,83 +341,119 @@ Rules:
 3. For skills: Extract technical skills, software, programming languages
 4. For experience: Include job titles, companies, and brief descriptions
 5. Keep each field concise but informative (max 200 chars per field)
-6. Return only valid JSON, no additional text
+6. Return ONLY valid JSON, no additional text or markdown formatting
 
 CV Text:
 ` + text
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	model := client.GenerativeModel("gemini-2.0-flash")
-	model.SetTemperature(0.1) // Low temperature for consistent extraction
-	model.SetMaxOutputTokens(500)
+	model.SetTemperature(0.1)
+	model.SetMaxOutputTokens(800)
 
 	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
 		return CVData{}, fmt.Errorf("gemini API error: %v", err)
 	}
 
-	if len(resp.Candidates) == 0 {
-		return CVData{}, fmt.Errorf("no candidates in Gemini response")
+	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+		return CVData{}, fmt.Errorf("empty response from Gemini")
 	}
 
-	if len(resp.Candidates[0].Content.Parts) == 0 {
-		return CVData{}, fmt.Errorf("no content parts in Gemini response")
-	}
-
-	// Extract content as string, handling the Text type properly
-	part := resp.Candidates[0].Content.Parts[0]
-	content := ""
-	if textPart, ok := part.(genai.Text); ok {
-		content = string(textPart)
-	} else {
-		content = fmt.Sprintf("%v", part)
-	}
-
-	// Clean the content - remove markdown code fences if present
-	content = strings.TrimSpace(content)
-	content = strings.TrimPrefix(content, "```json")
-	content = strings.TrimPrefix(content, "```")
-	content = strings.TrimSuffix(content, "```")
-	content = strings.TrimSpace(content)
+	// Extract and clean content
+	content := extractContentFromResponse(resp.Candidates[0].Content.Parts[0])
+	content = cleanJSONResponse(content)
 
 	var aiResp GeminiResponse
-	err = json.Unmarshal([]byte(content), &aiResp)
-	if err != nil {
-		return CVData{}, fmt.Errorf("failed to parse gemini response: %v (content: %s)", err, content)
+	if err := json.Unmarshal([]byte(content), &aiResp); err != nil {
+		return CVData{}, fmt.Errorf("failed to parse JSON: %v (content: %s)", err, content)
 	}
 
 	return CVData{
 		ID:         id,
-		Name:       aiResp.Name,
-		Phone:      aiResp.Phone,
-		Email:      aiResp.Email,
-		Education:  aiResp.Education,
-		Skills:     aiResp.Skills,
-		Experience: aiResp.Experience,
+		Name:       strings.TrimSpace(aiResp.Name),
+		Phone:      strings.TrimSpace(aiResp.Phone),
+		Email:      strings.TrimSpace(aiResp.Email),
+		Education:  strings.TrimSpace(aiResp.Education),
+		Skills:     strings.TrimSpace(aiResp.Skills),
+		Experience: strings.TrimSpace(aiResp.Experience),
 	}, nil
+}
+
+func extractContentFromResponse(part interface{}) string {
+	if textPart, ok := part.(genai.Text); ok {
+		return string(textPart)
+	}
+	return fmt.Sprintf("%v", part)
+}
+
+func cleanJSONResponse(content string) string {
+	content = strings.TrimSpace(content)
+	
+	// Remove markdown code fences
+	content = strings.TrimPrefix(content, "```json")
+	content = strings.TrimPrefix(content, "```JSON")
+	content = strings.TrimPrefix(content, "```")
+	content = strings.TrimSuffix(content, "```")
+	content = strings.TrimSpace(content)
+	
+	// Find JSON object bounds
+	start := strings.Index(content, "{")
+	end := strings.LastIndex(content, "}")
+	
+	if start != -1 && end != -1 && end > start {
+		content = content[start : end+1]
+	}
+	
+	return content
+}
+
+func isEmptyCV(cv CVData) bool {
+	return cv.Name == "" && cv.Phone == "" && cv.Email == ""
+}
+
+func renameProcessedFile(inputDir, oldFileName, id string) error {
+	ext := strings.ToLower(filepath.Ext(oldFileName))
+	newFileName := fmt.Sprintf("%s%s", id, ext)
+	oldPath := filepath.Join(inputDir, oldFileName)
+	newPath := filepath.Join(inputDir, newFileName)
+
+	// Don't rename if already has the target name
+	if oldFileName == newFileName {
+		return nil
+	}
+
+	// Check if target file already exists
+	if _, err := os.Stat(newPath); err == nil {
+		return fmt.Errorf("file %s already exists", newFileName)
+	}
+
+	return os.Rename(oldPath, newPath)
 }
 
 func extractTextFromPDF(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to open PDF: %v", err)
 	}
 	defer file.Close()
 
 	fileInfo, err := file.Stat()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to stat PDF: %v", err)
 	}
 
 	pdfReader, err := pdf.NewReader(file, fileInfo.Size())
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create PDF reader: %v", err)
 	}
 
 	var text strings.Builder
-	for i := 1; i <= pdfReader.NumPage(); i++ {
+	pageCount := pdfReader.NumPage()
+
+	for i := 1; i <= pageCount; i++ {
 		page := pdfReader.Page(i)
 		if page.V.IsNull() {
 			continue
@@ -356,42 +461,32 @@ func extractTextFromPDF(filePath string) (string, error) {
 
 		pageText, err := page.GetPlainText(nil)
 		if err != nil {
+			log.Printf("Warning: Could not extract text from page %d: %v", i, err)
 			continue
 		}
+
 		text.WriteString(pageText)
 		text.WriteString("\n")
 	}
 
-	return text.String(), nil
+	result := text.String()
+	if strings.TrimSpace(result) == "" {
+		return "", fmt.Errorf("no text content extracted from PDF")
+	}
+
+	return result, nil
 }
 
+// extractTextFromDOCX reads .docx/.doc files as zip archives and extracts text from word/document.xml
+// This works for both .docx and many .doc files saved in the Office Open XML format
 func extractTextFromDOCX(filePath string) (string, error) {
-	doc, err := document.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer doc.Close()
-
-	var text strings.Builder
-	for _, para := range doc.Paragraphs() {
-		for _, run := range para.Runs() {
-			text.WriteString(run.Text())
-		}
-		text.WriteString("\n")
-	}
-
-	return text.String(), nil
-}
-
-// extractTextFromDOCXFallback reads the .docx file as a zip archive, finds word/document.xml
-// and extracts text from <w:t> elements. This avoids the need for a unioffice license.
-func extractTextFromDOCXFallback(filePath string) (string, error) {
 	zr, err := zip.OpenReader(filePath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to open as zip archive: %v", err)
 	}
 	defer zr.Close()
 
+	// Find document.xml
 	var docFile *zip.File
 	for _, f := range zr.File {
 		if f.Name == "word/document.xml" {
@@ -399,51 +494,74 @@ func extractTextFromDOCXFallback(filePath string) (string, error) {
 			break
 		}
 	}
+
 	if docFile == nil {
-		return "", fmt.Errorf("word/document.xml not found in docx")
+		return "", fmt.Errorf("word/document.xml not found in archive")
 	}
 
 	rc, err := docFile.Open()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to open document.xml: %v", err)
 	}
 	defer rc.Close()
 
 	data, err := io.ReadAll(rc)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read document.xml: %v", err)
 	}
 
+	return parseWordXML(data)
+}
+
+// parseWordXML extracts text from Word XML content
+func parseWordXML(data []byte) (string, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	var sb strings.Builder
+	var inParagraph bool
+
 	for {
 		tok, err := decoder.Token()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("XML parsing error: %v", err)
 		}
+
 		switch se := tok.(type) {
 		case xml.StartElement:
-			// capture text nodes; local name may be "t" (w:t)
+			// Track paragraphs for better text formatting
+			if se.Name.Local == "p" {
+				inParagraph = true
+			}
+			// Extract text nodes (w:t elements)
 			if se.Name.Local == "t" {
 				var content string
 				if err := decoder.DecodeElement(&content, &se); err == nil {
 					sb.WriteString(content)
-					sb.WriteString(" ")
 				}
+			}
+		case xml.EndElement:
+			// Add newline after paragraphs
+			if se.Name.Local == "p" && inParagraph {
+				sb.WriteString("\n")
+				inParagraph = false
 			}
 		}
 	}
 
-	return strings.TrimSpace(sb.String()), nil
+	result := strings.TrimSpace(sb.String())
+	if result == "" {
+		return "", fmt.Errorf("no text content extracted from document")
+	}
+
+	return result, nil
 }
 
 func saveToCSV(data []CVData, filename string) error {
 	file, err := os.Create(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create CSV file: %v", err)
 	}
 	defer file.Close()
 
@@ -453,7 +571,7 @@ func saveToCSV(data []CVData, filename string) error {
 	// Write header
 	header := []string{"CV-ID", "Name", "Phone", "Email", "Education", "Skills", "Experience"}
 	if err := writer.Write(header); err != nil {
-		return err
+		return fmt.Errorf("failed to write CSV header: %v", err)
 	}
 
 	// Write data
@@ -468,7 +586,7 @@ func saveToCSV(data []CVData, filename string) error {
 			cv.Experience,
 		}
 		if err := writer.Write(record); err != nil {
-			return err
+			return fmt.Errorf("failed to write CSV record: %v", err)
 		}
 	}
 
