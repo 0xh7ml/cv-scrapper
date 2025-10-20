@@ -62,6 +62,7 @@ type Config struct {
 	APIKey      string
 	RetryCount  int
 	RetryDelay  time.Duration
+	Verbose     bool
 }
 
 func main() {
@@ -72,6 +73,7 @@ func main() {
 	flag.StringVar(&config.OutputFile, "o", "extracted_cvs.csv", "Output CSV file")
 	flag.StringVar(&config.APIKey, "key", "", "Gemini API key (or set GEMINI_API_KEY env var)")
 	flag.IntVar(&config.RetryCount, "retry", 3, "Number of retries for failed API calls")
+	flag.BoolVar(&config.Verbose, "v", false, "Enable verbose output (shows detailed errors and debug info)")
 	flag.Parse()
 
 	config.RetryDelay = 2 * time.Second
@@ -223,9 +225,13 @@ func processCVsConcurrently(validFiles []string, config Config, client *genai.Cl
 			} else {
 				failureCount++
 				if result.Error != nil {
-					fmt.Printf("[%d] %s - Error: %v\n", successCount+failureCount, result.FileName, result.Error)
+					if config.Verbose {
+						fmt.Printf("✗ [%d] %s - Error: %v\n", successCount+failureCount, result.FileName, result.Error)
+					} else {
+						fmt.Printf("✗ [%d] %s - Failed to process\n", successCount+failureCount, result.FileName)
+					}
 				} else {
-					fmt.Printf("[%d] %s - No useful data found\n", successCount+failureCount, result.FileName)
+					fmt.Printf("⊘ [%d] %s - No useful data found\n", successCount+failureCount, result.FileName)
 				}
 			}
 		case <-timeout:
@@ -252,7 +258,7 @@ func worker(jobs <-chan FileJob, results chan<- ProcessedCV, config Config, clie
 
 	for job := range jobs {
 		// Extract text from file
-		text, err := extractTextFromFile(job.FilePath)
+		text, err := extractTextFromFile(job.FilePath, config.Verbose)
 		if err != nil {
 			results <- ProcessedCV{
 				FileName: job.FileName,
@@ -273,7 +279,7 @@ func worker(jobs <-chan FileJob, results chan<- ProcessedCV, config Config, clie
 		}
 
 		// Extract CV data using Gemini with retry logic
-		cv, err := extractCVDataWithRetry(text, fmt.Sprintf("%03d", job.ID), client, config.RetryCount, config.RetryDelay)
+		cv, err := extractCVDataWithRetry(text, fmt.Sprintf("%03d", job.ID), client, config.RetryCount, config.RetryDelay, config.Verbose)
 		if err != nil {
 			results <- ProcessedCV{
 				FileName: job.FileName,
@@ -302,12 +308,12 @@ func worker(jobs <-chan FileJob, results chan<- ProcessedCV, config Config, clie
 	}
 }
 
-func extractTextFromFile(filePath string) (string, error) {
+func extractTextFromFile(filePath string, verbose bool) (string, error) {
 	ext := strings.ToLower(filepath.Ext(filePath))
 
 	switch ext {
 	case ".pdf":
-		return extractTextFromPDF(filePath)
+		return extractTextFromPDF(filePath, verbose)
 	case ".docx", ".doc":
 		return extractTextFromDOCX(filePath)
 	default:
@@ -315,7 +321,7 @@ func extractTextFromFile(filePath string) (string, error) {
 	}
 }
 
-func extractCVDataWithRetry(text, id string, client *genai.Client, retryCount int, retryDelay time.Duration) (CVData, error) {
+func extractCVDataWithRetry(text, id string, client *genai.Client, retryCount int, retryDelay time.Duration, verbose bool) (CVData, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= retryCount; attempt++ {
@@ -323,21 +329,24 @@ func extractCVDataWithRetry(text, id string, client *genai.Client, retryCount in
 			time.Sleep(retryDelay * time.Duration(attempt))
 		}
 
-		cv, err := extractCVDataWithGemini(text, id, client)
+		cv, err := extractCVDataWithGemini(text, id, client, verbose)
 		if err == nil {
 			return cv, nil
 		}
 
 		lastErr = err
 		if attempt < retryCount {
-			log.Printf("Retry %d/%d for CV %s: %v", attempt+1, retryCount, id, err)
+			// Only log retry details in verbose mode to avoid cluttering output
+			if verbose {
+				log.Printf("Retry %d/%d for CV %s: %v", attempt+1, retryCount, id, err)
+			}
 		}
 	}
 
 	return CVData{}, fmt.Errorf("failed after %d retries: %v", retryCount, lastErr)
 }
 
-func extractCVDataWithGemini(text, id string, client *genai.Client) (CVData, error) {
+func extractCVDataWithGemini(text, id string, client *genai.Client, verbose bool) (CVData, error) {
 	// Truncate text if too long (Gemini has token limits)
 	if len(text) > 10000 {
 		text = text[:10000] + "... [truncated]"
@@ -386,7 +395,11 @@ CV Text:
 
 	var aiResp GeminiResponse
 	if err := json.Unmarshal([]byte(content), &aiResp); err != nil {
-		return CVData{}, fmt.Errorf("failed to parse JSON: %v (content: %s)", err, content)
+		if verbose {
+			return CVData{}, fmt.Errorf("failed to parse JSON: %v (content: %s)", err, content)
+		} else {
+			return CVData{}, fmt.Errorf("failed to parse API response as JSON")
+		}
 	}
 
 	return CVData{
@@ -451,7 +464,7 @@ func renameProcessedFile(inputDir, oldFileName, id string) error {
 	return os.Rename(oldPath, newPath)
 }
 
-func extractTextFromPDF(filePath string) (string, error) {
+func extractTextFromPDF(filePath string, verbose bool) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open PDF: %v", err)
@@ -479,7 +492,9 @@ func extractTextFromPDF(filePath string) (string, error) {
 
 		pageText, err := page.GetPlainText(nil)
 		if err != nil {
-			log.Printf("Warning: Could not extract text from page %d: %v", i, err)
+			if verbose {
+				log.Printf("Warning: Could not extract text from page %d: %v", i, err)
+			}
 			continue
 		}
 
