@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,17 +78,38 @@ func main() {
 	// Load configuration
 	config, err := loadConfig()
 	if err != nil {
-		log.Fatal("Failed to load configuration:", err)
+		fmt.Fprintf(os.Stderr, "   Configuration Error:\n%v\n\n", err)
+		fmt.Fprintf(os.Stderr, "   Please check your .env file and ensure all required values are set.\n")
+		fmt.Fprintf(os.Stderr, "   Example .env file:\n")
+		os.Exit(1)
 	}
 
-	fmt.Printf("Starting CV scraper...\n")
-	fmt.Printf("Fetching candidates from ID %d to %d\n", config.StartID, config.EndID)
-	fmt.Printf("Using %d concurrent workers\n", config.Concurrency)
+	fmt.Printf("🚀 Starting CV scraper...\n")
+	fmt.Printf("📊 Fetching candidates from ID %d to %d\n", config.StartID, config.EndID)
+	fmt.Printf("⚡ Using %d concurrent workers\n", config.Concurrency)
+	fmt.Printf("📁 Output file: %s\n", config.OutputFile)
+	fmt.Printf("⏱️  Request timeout: %v\n", config.Timeout)
+	fmt.Println()
+
+	// Create output directory if it doesn't exist
+	outputDir := filepath.Dir(config.OutputFile)
+	if outputDir != "." && outputDir != "" {
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Failed to create output directory '%s': %v\n", outputDir, err)
+			fmt.Fprintf(os.Stderr, "💡 Please check directory permissions and try again\n")
+			os.Exit(1)
+		}
+	}
 
 	// Create CSV file
 	csvFile, err := os.Create(config.OutputFile)
 	if err != nil {
-		log.Fatal("Failed to create CSV file:", err)
+		fmt.Fprintf(os.Stderr, "❌ Failed to create output CSV file '%s': %v\n", config.OutputFile, err)
+		fmt.Fprintf(os.Stderr, "💡 Please check:\n")
+		fmt.Fprintf(os.Stderr, "   - The output directory exists and is writable\n")
+		fmt.Fprintf(os.Stderr, "   - You have permission to create files in this location\n")
+		fmt.Fprintf(os.Stderr, "   - The file is not currently open in another program\n")
+		os.Exit(1)
 	}
 	defer csvFile.Close()
 
@@ -97,13 +119,23 @@ func main() {
 	// Write CSV header
 	header := []string{"ID", "Name", "Phone", "Email", "Experience", "Skills", "Resume Files"}
 	if err := csvWriter.Write(header); err != nil {
-		log.Fatal("Failed to write CSV header:", err)
+		fmt.Fprintf(os.Stderr, "❌ Failed to write CSV header: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Start processing
 	candidates := processCandidatesConcurrently(config, csvWriter)
 
-	fmt.Printf("\n✓ Successfully processed %d candidates and saved to %s\n", candidates, config.OutputFile)
+	if candidates > 0 {
+		fmt.Printf("\nSuccessfully processed %d candidates and saved to %s\n", candidates, config.OutputFile)
+	} else {
+		fmt.Printf("\nNo candidates were processed successfully.\n")
+		fmt.Printf("   This might be due to:\n")
+		fmt.Printf("   - Invalid ID range (no candidates exist in this range)\n")
+		fmt.Printf("   - Authentication issues (check your AUTH_TOKEN)\n")
+		fmt.Printf("   - API connectivity problems\n")
+		fmt.Printf("   - Use VERBOSE=true in .env for detailed error logging\n")
+	}
 }
 
 func loadConfig() (*Config, error) {
@@ -120,11 +152,51 @@ func loadConfig() (*Config, error) {
 		Concurrency: getEnvInt("CONCURRENCY", 10),
 		OutputFile:  getEnv("OUTPUT_FILE", "candidates.csv"),
 		Timeout:     time.Duration(getEnvInt("TIMEOUT_SECONDS", 30)) * time.Second,
-		S3Bucket:    getEnv("S3_BUCKET_URL", "https://atbjobs.s3.ap-southeast-1.amazonaws.com/candidate/resume/"),
+		S3Bucket:    getEnv("S3_BUCKET_URL", ""),
+	}
+
+	// Validate required configuration
+	var errors []string
+
+	if config.BaseURL == "" {
+		errors = append(errors, "API_BASE_URL is required")
 	}
 
 	if config.AuthToken == "" {
-		return nil, fmt.Errorf("AUTH_TOKEN is required in .env file")
+		errors = append(errors, "AUTH_TOKEN is required")
+	}
+
+	if config.StartID < 1 {
+		errors = append(errors, "START_ID must be greater than 0")
+	}
+
+	if config.EndID < config.StartID {
+		errors = append(errors, "END_ID must be greater than or equal to START_ID")
+	}
+
+	if config.Concurrency < 1 {
+		errors = append(errors, "CONCURRENCY must be greater than 0")
+	}
+
+	if config.Concurrency > 50 {
+		errors = append(errors, "CONCURRENCY should not exceed 50 to avoid overwhelming the API")
+	}
+
+	if config.OutputFile == "" {
+		errors = append(errors, "OUTPUT_FILE cannot be empty")
+	}
+
+	if config.Timeout < time.Second {
+		errors = append(errors, "TIMEOUT_SECONDS must be at least 1 second")
+	}
+
+	if config.S3Bucket == "" {
+		errors = append(errors, "S3_BUCKET_URL cannot be empty")
+	}
+
+	// If there are validation errors, return them
+	if len(errors) > 0 {
+		return nil, fmt.Errorf("configuration validation failed:\n  - %s", strings.Join(errors, "\n  - "))
 	}
 
 	return config, nil
@@ -235,7 +307,7 @@ func fetchCandidate(client *http.Client, id int, config *Config) (*ProcessedCand
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
+		return nil, fmt.Errorf("failed to create HTTP request for ID %d: %v", id, err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+config.AuthToken)
@@ -243,27 +315,49 @@ func fetchCandidate(client *http.Client, id int, config *Config) (*ProcessedCand
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %v", err)
+		return nil, fmt.Errorf("HTTP request failed for ID %d: %v", id, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	// Handle different HTTP status codes with specific messages
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// Continue processing
+	case http.StatusUnauthorized:
+		return nil, fmt.Errorf("authentication failed for ID %d - please check your AUTH_TOKEN", id)
+	case http.StatusForbidden:
+		return nil, fmt.Errorf("access forbidden for ID %d - insufficient permissions", id)
+	case http.StatusNotFound:
+		return nil, fmt.Errorf("candidate ID %d not found", id)
+	case http.StatusTooManyRequests:
+		return nil, fmt.Errorf("rate limit exceeded for ID %d - consider reducing CONCURRENCY", id)
+	case http.StatusInternalServerError:
+		return nil, fmt.Errorf("server error for ID %d - API may be experiencing issues", id)
+	default:
+		return nil, fmt.Errorf("unexpected HTTP status %d for ID %d", resp.StatusCode, id)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
+		return nil, fmt.Errorf("failed to read response body for ID %d: %v", id, err)
+	}
+
+	if len(body) == 0 {
+		return nil, fmt.Errorf("empty response body for ID %d", id)
 	}
 
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %v", err)
+		return nil, fmt.Errorf("failed to parse JSON response for ID %d: %v", id, err)
 	}
 
 	// Check if the response indicates success and has data
-	if !apiResp.Success || apiResp.Response.Data == nil {
-		return nil, nil // Skip this record
+	if !apiResp.Success {
+		return nil, nil // Skip this record - API indicates no success
+	}
+
+	if apiResp.Response.Data == nil {
+		return nil, nil // Skip this record - no data available
 	}
 
 	return processCandidate(apiResp.Response.Data, config), nil
